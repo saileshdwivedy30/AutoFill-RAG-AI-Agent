@@ -1,0 +1,7 @@
+llama-index
+llama-parse
+openai
+gradio
+python-dotenv
+nest_asyncio
+app

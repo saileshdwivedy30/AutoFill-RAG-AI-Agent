@@ -1,0 +1,20 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Ignore environment files
+.env
+
+# Ignore IDE-specific files
+.idea/
+*.iml
+
+# Ignore inspection and workspace settings
+.idea/**
+uploads/
+venv/
+storage/
+
