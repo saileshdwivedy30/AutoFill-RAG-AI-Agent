@@ -5,3 +5,4 @@ gradio
 python-dotenv
 nest_asyncio
 app
+rapidfuzz

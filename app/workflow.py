@@ -1,10 +1,16 @@
-import os, json, re
+import os, json, re, shutil, hashlib
+from rapidfuzz import fuzz
 from app.events import *
 from app.parser import parse_resume, parse_application_form
 from app.llm_utils import get_llm, get_embed_model
 from llama_index.core import VectorStoreIndex, StorageContext, load_index_from_storage
 from llama_index.core.workflow import Workflow, step, Context, InputRequiredEvent, StopEvent, StartEvent, HumanResponseEvent
 
+
+def get_file_hash(file_path):
+    """Generate a SHA256 hash from the file contents."""
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 class RAGWorkflow(Workflow):
     storage_dir = "./storage"
@@ -16,30 +22,33 @@ class RAGWorkflow(Workflow):
         if not ev.resume_file or not ev.application_form:
             raise ValueError("Missing resume or application form")
 
-        print("📎 set_up called with StartEvent:")
+        print("   set_up called with StartEvent:")
         print("   resume_file:", ev.resume_file)
         print("   application_form:", ev.application_form)
 
+        # Use resume hash as unique storage path
+        resume_hash = get_file_hash(ev.resume_file)
+        self.storage_dir = f"./storage/{resume_hash}"
+
         if os.path.exists(self.storage_dir):
+            print("Using cached index for this resume")
             storage_context = StorageContext.from_defaults(persist_dir=self.storage_dir)
             index = load_index_from_storage(storage_context)
         else:
+            print("New resume detected — parsing and indexing")
             documents = parse_resume(ev.resume_file)
-            print("📄 Parsed resume:", documents)
             if not documents:
-                print("❌ No documents returned from parse_resume!")
-            else:
-                for i, doc in enumerate(documents):
-                    print(f"📝 Doc {i} Preview:", doc.text[:300])
+                raise ValueError("Resume parsing returned no documents.")
             index = VectorStoreIndex.from_documents(documents, embed_model=get_embed_model())
             index.storage_context.persist(persist_dir=self.storage_dir)
 
-            # Test query
-            test_result = index.as_query_engine(llm=self.llm).query("What is the candidate's current job title?")
-            print("🧪 Test query result:", test_result.response)
+            # # test query
+            # test_result = index.as_query_engine(llm=self.llm).query("What is the candidate's current job title?")
+            # print("🧪 Test query result:", test_result.response)
 
         self.query_engine = index.as_query_engine(llm=self.llm, similarity_top_k=5)
         return ParseFormEvent(application_form=ev.application_form)
+
 
     @step
     async def parse_form(self, ctx: Context, ev: ParseFormEvent) -> GenerateQuestionsEvent:
@@ -59,30 +68,46 @@ class RAGWorkflow(Workflow):
         Return **only** valid JSON — no markdown, no comments, no explanations.
         """)
 
-        print("🧠 LLM returned (raw):", raw_json.text)
-
-        # Remove ```json or ``` from LLM response
+        print("LLM returned (raw):", raw_json.text)
         cleaned_json = re.sub(r"```.*?\n", "", raw_json.text).strip().replace("```", "")
 
         try:
             fields = json.loads(cleaned_json)["fields"]
-            print("✅ Parsed fields:", fields)
+            print("Parsed fields:", fields)
         except Exception as e:
-            print("❌ Failed to parse cleaned LLM response:", cleaned_json)
+            print("Failed to parse cleaned LLM response:", cleaned_json)
             raise ValueError(f"Could not parse JSON from LLM: {e}")
 
         await ctx.set("fields_to_fill", fields)
+        await ctx.set("field_answers", {})
         return GenerateQuestionsEvent()
 
     @step
     async def generate_questions(self, ctx: Context, ev: GenerateQuestionsEvent | FeedbackEvent) -> QueryEvent:
         fields = await ctx.get("fields_to_fill")
-        for field in fields:
+        feedback = ""
+        matched_fields = []
+
+        if isinstance(ev, FeedbackEvent):
+            feedback = ev.feedback.lower()
+            matched_fields = [
+                field for field in fields
+                if fuzz.partial_ratio(field.lower(), feedback) > 70
+            ]
+            print("Matched feedback to fields:", matched_fields)
+
+        fields_to_query = matched_fields if matched_fields else fields
+
+        for field in fields_to_query:
             question = f"How would you answer this question about the candidate? <field>{field}</field>"
-            if hasattr(ev, "feedback"):
-                question += f"\nFeedback: <feedback>{ev.feedback}</feedback>"
+            if feedback:
+                question += f"\nFeedback: <feedback>{feedback}</feedback>"
+            print(f"Sending query for field '{field}': {question}")
             ctx.send_event(QueryEvent(field=field, query=question))
+
         await ctx.set("total_fields", len(fields))
+        await ctx.set("fields_to_query", fields_to_query)
+        await ctx.set("latest_feedback", feedback)
         return
 
     @step
@@ -92,31 +117,35 @@ class RAGWorkflow(Workflow):
 
     @step
     async def fill_in_application(self, ctx: Context, ev: ResponseEvent) -> InputRequiredEvent:
-        total_fields = await ctx.get("total_fields")
-        responses = ctx.collect_events(ev, [ResponseEvent] * total_fields)
-        if responses is None:
-            return None
-        responseList = "\n".join(f"Field: {r.field}\nResponse: {r.response}" for r in responses)
-        result = self.llm.complete(f"""
-        Combine the field-response pairs into a filled application form.
-        <responses>
-        {responseList}
-        </responses>
-        """)
-        await ctx.set("filled_form", str(result))
-        return InputRequiredEvent(prefix="Feedback?", result=result)
+        fields = await ctx.get("fields_to_fill")
+        prev_answers = await ctx.get("field_answers", default={})
+        fields_just_updated = await ctx.get("fields_to_query")
 
-    # @step
-    # async def get_feedback(self, ctx: Context, ev: HumanResponseEvent) -> FeedbackEvent | StopEvent:
-    #     result = self.llm.complete(f"""
-    #     Human feedback: <feedback>{ev.response}</feedback>
-    #     Reply 'OKAY' if it's good, else 'FEEDBACK'.
-    #     """)
-    #     verdict = result.text.strip()
-    #     print(f"🧠 LLM Feedback Verdict: '{verdict}'")
-    #     if verdict == "OKAY":
-    #         return StopEvent(result=await ctx.get("filled_form"))
-    #     return FeedbackEvent(feedback=ev.response)
+        print("🧪 Debug: fields to query:", fields_just_updated)
+        print("🧪 Debug: previous answers BEFORE update:", prev_answers)
+
+        # Collect only the new responses
+        new_responses = ctx.collect_events(ev, [ResponseEvent] * len(fields_just_updated))
+        if new_responses is None:
+            print("No new responses collected.")
+            return None
+
+        # Update just the changed fields
+        for r in new_responses:
+            print(f"Updating field: {r.field} -> {r.response}")
+            prev_answers[r.field] = r.response
+
+        await ctx.set("field_answers", prev_answers)
+
+        # Format final output in readable form
+        formatted_form = "\n\n".join(
+            f"{field}: {prev_answers[field]}" for field in fields if field in prev_answers
+        )
+        full_output = f"Application Form\n\n{formatted_form}"
+        print("Final formatted form:\n", full_output)
+
+        await ctx.set("filled_form", full_output)
+        return InputRequiredEvent(prefix="Feedback?", result=full_output)
 
     @step
     async def get_feedback(self, ctx: Context, ev: HumanResponseEvent) -> FeedbackEvent | StopEvent:
@@ -140,13 +169,11 @@ class RAGWorkflow(Workflow):
         """)
 
         verdict = result.text.strip()
-        print(f"🧠 LLM Feedback Verdict: '{verdict}'")
+        print(f"LLM Feedback Verdict: '{verdict}'")
 
         if verdict == "OKAY":
             return StopEvent(result=filled_form)
         else:
             return FeedbackEvent(feedback=ev.response)
-
-
 
 
