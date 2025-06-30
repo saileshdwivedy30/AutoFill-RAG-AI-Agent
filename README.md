@@ -1,5 +1,5 @@
 
-# 🧠 Agentic Resume Filler
+# 🧠 Resume RAG AI Agent
 
 An intelligent agent that automatically fills out job application forms using information extracted from a candidate's resume — powered by **LLMs**, **RAG**, and a **multi-turn feedback loop**.
 
